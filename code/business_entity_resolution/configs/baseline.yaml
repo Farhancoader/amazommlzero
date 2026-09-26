@@ -1,0 +1,42 @@
+# Baseline configuration
+blocking:
+  exact_name: true
+  tfidf_name_top_k: 50
+  tfidf_name_ngram_range: [2, 5]
+  tfidf_addr_top_k: 50
+  tfidf_addr_ngram_range: [2, 6]
+  token_min_shared: 2
+  country: true
+  use_embeddings: false
+  embedding_top_k: 50
+
+models:
+  lgbm: true
+  e5: false
+  bge: false
+  neural: false
+  cross_encoder: false
+
+lgbm_params:
+  num_leaves: 63
+  max_depth: -1
+  learning_rate: 0.05
+  n_estimators: 500
+  min_child_samples: 20
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+
+decision:
+  threshold: 0.80
+  use_margin: true
+  minimum_margin: 0.10
+
+inference:
+  batch_size: 64
+
+val_fraction: 0.2
+sample_size: null
+
+output_dir: "output"

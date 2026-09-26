@@ -1,0 +1,77 @@
+# Final competition configuration
+blocking:
+  exact_name: true
+  tfidf_name_top_k: 50
+  tfidf_name_ngram_range: [2, 5]
+  tfidf_addr_top_k: 50
+  tfidf_addr_ngram_range: [2, 6]
+  token_min_shared: 2
+  country: true
+  use_embeddings: true
+  embedding_top_k: 50
+
+models:
+  lgbm: true
+  e5: true
+  bge: true
+  neural: true
+  cross_encoder: true
+
+lgbm_params:
+  num_leaves: 127
+  max_depth: -1
+  learning_rate: 0.03
+  n_estimators: 1000
+  min_child_samples: 30
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+
+embedding_models:
+  - "e5-base-v2"
+  - "bge-base-en-v1.5"
+
+neural:
+  model_key: "e5-base-v2"
+  hidden_dim: 256
+  dropout: 0.2
+  freeze_encoder: true
+  batch_size: 64
+  lr: 2e-5
+  epochs: 10
+  patience: 3
+  mixed_precision: true
+
+cross_encoder:
+  model_key: "e5-base-v2"
+  hidden_dim: 256
+  dropout: 0.2
+  freeze_encoder: true
+  batch_size: 32
+  lr: 2e-5
+  epochs: 5
+  top_k: 10
+  patience: 2
+  mixed_precision: true
+
+fusion_weights:
+  lgbm: 1.0
+  e5: 0.5
+  bge: 0.5
+  neural: 0.5
+  cross_encoder: 1.0
+
+decision:
+  threshold: 0.70
+  use_margin: true
+  minimum_margin: 0.15
+  multi_match: false
+
+inference:
+  batch_size: 64
+
+val_fraction: 0.2
+sample_size: null
+
+output_dir: "output"

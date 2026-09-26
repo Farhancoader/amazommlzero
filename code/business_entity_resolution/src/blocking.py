@@ -1,248 +1,497 @@
 """
-Blocking / Candidate Generation for entity resolution.
+Multi-stage candidate generation (blocking) for entity resolution.
 
-Uses multiple blocking strategies combined:
-1. TF-IDF cosine similarity on combined name+address text (within same country)
-2. Character n-gram TF-IDF for fuzzy name matching
-3. Exact/near-exact name token blocking as a fallback
+Implements independent blocking methods:
+1. Exact normalized name match
+2. Name character TF-IDF (n-gram)
+3. Address character TF-IDF (n-gram)
+4. Token similarity (Jaccard)
+5. Country-compatible candidates
+6. Embedding nearest neighbors (placeholder for later)
 
-The goal: high recall (capture all true matches) with reasonable reduction ratio.
+Final candidate set = UNION of all blockers.
 """
+
+import logging
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
-from scipy.sparse import vstack
-from collections import defaultdict
-import logging
+from sklearn.neighbors import NearestNeighbors
+
+from config import (
+    TRAIN_SOURCE1, TRAIN_SOURCE2, TRAIN_SOURCE3,
+    TEST_SOURCE1, TEST_SOURCE2, TEST_SOURCE3,
+    S1_PREFIX, S2_PREFIX, S3_PREFIX,
+    DEFAULT_TFIDF_NAME_TOP_K, DEFAULT_TFIDF_ADDRESS_TOP_K,
+    DEFAULT_TOKEN_MIN_SHARED, DEFAULT_EMBEDDING_TOP_K,
+)
+from io_utils import load_tsv
+from normalization import add_normalized_columns, get_tokens, jaccard_tokens
 
 logger = logging.getLogger(__name__)
 
 
-def _build_tfidf_candidates(
-    s1_df: pd.DataFrame,
-    s2s3_df: pd.DataFrame,
-    text_col: str = "combined_text",
-    top_k: int = 50,
-    ngram_range: tuple = (1, 2),
-    analyzer: str = "word",
-    min_score: float = 0.05,
-) -> dict:
-    """
-    Use TF-IDF cosine similarity to find top-k candidates from S2/S3
-    for each S1 entity.
+# ── Data loading ────────────────────────────────────────────────────
 
-    Returns dict: s1_entity_id -> list of (s2s3_entity_id, score)
-    """
-    logger.info(f"Building TF-IDF candidates (analyzer={analyzer}, ngrams={ngram_range}, top_k={top_k})...")
+def load_all_sources(train: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load all three sources with normalization applied."""
+    if train:
+        s1 = load_tsv(TRAIN_SOURCE1)
+        s2 = load_tsv(TRAIN_SOURCE2)
+        s3 = load_tsv(TRAIN_SOURCE3)
+    else:
+        s1 = load_tsv(TEST_SOURCE1)
+        s2 = load_tsv(TEST_SOURCE2)
+        s3 = load_tsv(TEST_SOURCE3)
 
-    all_texts = pd.concat([s1_df[text_col], s2s3_df[text_col]], ignore_index=True)
+    for df in [s1, s2, s3]:
+        add_normalized_columns(df)
 
+    return s1, s2, s3
+
+
+# ── Block 1: Exact Normalized Name ──────────────────────────────────
+
+def block_exact_name(
+    s1: pd.DataFrame,
+    s2: pd.DataFrame,
+    s3: pd.DataFrame,
+    name_col: str = "business_name_norm",
+) -> pd.DataFrame:
+    """Block 1: Exact match on normalized business name."""
+    # Build lookup from S2/S3 normalized name -> entity_ids
+    name_to_s2 = defaultdict(list)
+    for _, row in s2.iterrows():
+        name = row[name_col]
+        if name:
+            name_to_s2[name].append(row["entity_id"])
+
+    name_to_s3 = defaultdict(list)
+    for _, row in s3.iterrows():
+        name = row[name_col]
+        if name:
+            name_to_s3[name].append(row["entity_id"])
+
+    rows = []
+    for _, s1_row in s1.iterrows():
+        s1_id = s1_row["entity_id"]
+        name = s1_row[name_col]
+        if not name:
+            continue
+
+        for cand_id in name_to_s2.get(name, []):
+            rows.append({
+                "s1_id": s1_id,
+                "candidate_id": cand_id,
+                "candidate_source": "S2",
+                "blocking_method": "name_exact",
+            })
+        for cand_id in name_to_s3.get(name, []):
+            rows.append({
+                "s1_id": s1_id,
+                "candidate_id": cand_id,
+                "candidate_source": "S3",
+                "blocking_method": "name_exact",
+            })
+
+    df = pd.DataFrame(rows)
+    logger.info(f"Block 1 (exact name): {len(df)} candidate pairs")
+    return df
+
+
+# ── Block 2: Name Character TF-IDF ──────────────────────────────────
+
+def block_tfidf_name(
+    s1: pd.DataFrame,
+    s2: pd.DataFrame,
+    s3: pd.DataFrame,
+    top_k: int = DEFAULT_TFIDF_NAME_TOP_K,
+    ngram_range: Tuple[int, int] = (2, 5),
+    name_col: str = "business_name_norm",
+) -> pd.DataFrame:
+    """Block 2: Character n-gram TF-IDF on normalized business name."""
+    # Combine S2 and S3 for single index
+    s23 = pd.concat([
+        s2[["entity_id", name_col]].assign(source="S2"),
+        s3[["entity_id", name_col]].assign(source="S3"),
+    ], ignore_index=True)
+    s23 = s23[s23[name_col].str.len() > 0].reset_index(drop=True)
+
+    # Fit TF-IDF on S2+S3 names
+    ngram_range = tuple(ngram_range) if isinstance(ngram_range, list) else ngram_range
     vectorizer = TfidfVectorizer(
-        analyzer=analyzer,
+        analyzer="char",
         ngram_range=ngram_range,
-        max_features=100000,
-        sublinear_tf=True,
         min_df=1,
         max_df=0.95,
+        sublinear_tf=True,
     )
-    tfidf_matrix = vectorizer.fit_transform(all_texts)
+    tfidf_matrix = vectorizer.fit_transform(s23[name_col])
 
-    s1_vectors = tfidf_matrix[: len(s1_df)]
-    s2s3_vectors = tfidf_matrix[len(s1_df):]
+    # Transform S1 names
+    s1_valid = s1[s1[name_col].str.len() > 0].reset_index(drop=True)
+    s1_tfidf = vectorizer.transform(s1_valid[name_col])
 
-    s1_ids = s1_df["entity_id"].values
-    s2s3_ids = s2s3_df["entity_id"].values
+    # Nearest neighbors
+    nn = NearestNeighbors(n_neighbors=min(top_k, len(s23)), metric="cosine")
+    nn.fit(tfidf_matrix)
 
-    candidates = {}
+    distances, indices = nn.kneighbors(s1_tfidf)
 
-    # Process in batches to avoid memory issues
-    batch_size = 500
-    for start in range(0, len(s1_df), batch_size):
-        end = min(start + batch_size, len(s1_df))
-        batch_vectors = s1_vectors[start:end]
+    rows = []
+    for i, s1_idx in enumerate(s1_valid.index):
+        s1_id = s1_valid.loc[s1_idx, "entity_id"]
+        for rank, (dist, idx) in enumerate(zip(distances[i], indices[i])):
+            cand_row = s23.iloc[idx]
+            rows.append({
+                "s1_id": s1_id,
+                "candidate_id": cand_row["entity_id"],
+                "candidate_source": cand_row["source"],
+                "blocking_method": f"tfidf_name_{ngram_range[0]}_{ngram_range[1]}",
+                "tfidf_score": 1.0 - dist,  # cosine similarity
+            })
 
-        # Cosine similarity (vectors are already L2-normalized by TF-IDF)
-        sim_matrix = (batch_vectors @ s2s3_vectors.T).toarray()
-
-        for i in range(end - start):
-            scores = sim_matrix[i]
-            # Get top-k indices
-            if top_k < len(scores):
-                top_indices = np.argpartition(scores, -top_k)[-top_k:]
-            else:
-                top_indices = np.arange(len(scores))
-
-            s1_id = s1_ids[start + i]
-            cands = []
-            for idx in top_indices:
-                if scores[idx] >= min_score:
-                    cands.append((s2s3_ids[idx], float(scores[idx])))
-            candidates[s1_id] = cands
-
-    logger.info(f"  TF-IDF ({analyzer}) generated candidates for {len(candidates)} S1 entities")
-    return candidates
+    df = pd.DataFrame(rows)
+    logger.info(f"Block 2 (TF-IDF name {ngram_range}): {len(df)} candidate pairs")
+    return df
 
 
-def _build_char_ngram_candidates(
-    s1_df: pd.DataFrame,
-    s2s3_df: pd.DataFrame,
-    top_k: int = 30,
-    min_score: float = 0.1,
-) -> dict:
-    """Character n-gram TF-IDF for catching typos and transliterations."""
-    return _build_tfidf_candidates(
-        s1_df, s2s3_df,
-        text_col="name_norm",
-        top_k=top_k,
-        ngram_range=(2, 4),
-        analyzer="char_wb",
-        min_score=min_score,
+# ── Block 3: Address Character TF-IDF ───────────────────────────────
+
+def block_tfidf_address(
+    s1: pd.DataFrame,
+    s2: pd.DataFrame,
+    s3: pd.DataFrame,
+    top_k: int = DEFAULT_TFIDF_ADDRESS_TOP_K,
+    ngram_range: Tuple[int, int] = (2, 6),
+    addr_col: str = "business_address_norm",
+) -> pd.DataFrame:
+    """Block 3: Character n-gram TF-IDF on normalized address."""
+    s23 = pd.concat([
+        s2[["entity_id", addr_col]].assign(source="S2"),
+        s3[["entity_id", addr_col]].assign(source="S3"),
+    ], ignore_index=True)
+    s23 = s23[s23[addr_col].str.len() > 0].reset_index(drop=True)
+
+    ngram_range = tuple(ngram_range) if isinstance(ngram_range, list) else ngram_range
+    vectorizer = TfidfVectorizer(
+        analyzer="char",
+        ngram_range=ngram_range,
+        min_df=1,
+        max_df=0.95,
+        sublinear_tf=True,
     )
+    tfidf_matrix = vectorizer.fit_transform(s23[addr_col])
+
+    s1_valid = s1[s1[addr_col].str.len() > 0].reset_index(drop=True)
+    s1_tfidf = vectorizer.transform(s1_valid[addr_col])
+
+    nn = NearestNeighbors(n_neighbors=min(top_k, len(s23)), metric="cosine")
+    nn.fit(tfidf_matrix)
+
+    distances, indices = nn.kneighbors(s1_tfidf)
+
+    rows = []
+    for i, s1_idx in enumerate(s1_valid.index):
+        s1_id = s1_valid.loc[s1_idx, "entity_id"]
+        for dist, idx in zip(distances[i], indices[i]):
+            cand_row = s23.iloc[idx]
+            rows.append({
+                "s1_id": s1_id,
+                "candidate_id": cand_row["entity_id"],
+                "candidate_source": cand_row["source"],
+                "blocking_method": f"tfidf_addr_{ngram_range[0]}_{ngram_range[1]}",
+                "tfidf_score": 1.0 - dist,
+            })
+
+    df = pd.DataFrame(rows)
+    logger.info(f"Block 3 (TF-IDF address {ngram_range}): {len(df)} candidate pairs")
+    return df
 
 
-def _build_token_blocking_candidates(
-    s1_df: pd.DataFrame,
-    s2s3_df: pd.DataFrame,
-    min_shared_tokens: int = 2,
-    max_block_size: int = 500,
-) -> dict:
+# ── Block 4: Token Jaccard Similarity ───────────────────────────────
+
+def block_token_jaccard(
+    s1: pd.DataFrame,
+    s2: pd.DataFrame,
+    s3: pd.DataFrame,
+    min_shared: int = DEFAULT_TOKEN_MIN_SHARED,
+    name_col: str = "business_name_tokens",
+    addr_col: str = "business_address_tokens",
+) -> pd.DataFrame:
+    """Block 4: Token-based Jaccard similarity on name and address tokens."""
+    # Build inverted index: token -> set of entity_ids for S2/S3
+    token_to_s2 = defaultdict(set)
+    token_to_s3 = defaultdict(set)
+
+    for _, row in s2.iterrows():
+        tokens = set(get_tokens(row[name_col])) if row[name_col] else set()
+        addr_tokens = set(get_tokens(row[addr_col])) if row[addr_col] else set()
+        all_tokens = tokens | addr_tokens
+        for tok in all_tokens:
+            token_to_s2[tok].add(row["entity_id"])
+
+    for _, row in s3.iterrows():
+        tokens = set(get_tokens(row[name_col])) if row[name_col] else set()
+        addr_tokens = set(get_tokens(row[addr_col])) if row[addr_col] else set()
+        all_tokens = tokens | addr_tokens
+        for tok in all_tokens:
+            token_to_s3[tok].add(row["entity_id"])
+
+    rows = []
+    for _, s1_row in s1.iterrows():
+        s1_id = s1_row["entity_id"]
+        s1_name_tokens = set(get_tokens(s1_row[name_col])) if s1_row[name_col] else set()
+        s1_addr_tokens = set(get_tokens(s1_row[addr_col])) if s1_row[addr_col] else set()
+        s1_all_tokens = s1_name_tokens | s1_addr_tokens
+
+        if not s1_all_tokens:
+            continue
+
+        # Find candidates sharing tokens
+        s2_candidates = defaultdict(int)
+        s3_candidates = defaultdict(int)
+
+        for tok in s1_all_tokens:
+            for cid in token_to_s2.get(tok, set()):
+                s2_candidates[cid] += 1
+            for cid in token_to_s3.get(tok, set()):
+                s3_candidates[cid] += 1
+
+        # Keep only those with minimum shared tokens
+        for cid, count in s2_candidates.items():
+            if count >= min_shared:
+                rows.append({
+                    "s1_id": s1_id,
+                    "candidate_id": cid,
+                    "candidate_source": "S2",
+                    "blocking_method": "token_jaccard",
+                    "shared_tokens": count,
+                })
+        for cid, count in s3_candidates.items():
+            if count >= min_shared:
+                rows.append({
+                    "s1_id": s1_id,
+                    "candidate_id": cid,
+                    "candidate_source": "S3",
+                    "blocking_method": "token_jaccard",
+                    "shared_tokens": count,
+                })
+
+    df = pd.DataFrame(rows)
+    logger.info(f"Block 4 (token Jaccard, min_shared={min_shared}): {len(df)} candidate pairs")
+    return df
+
+
+# ── Block 5: Country-Compatible ─────────────────────────────────────
+
+def block_by_country(
+    s1: pd.DataFrame,
+    s2: pd.DataFrame,
+    s3: pd.DataFrame,
+    country_col: str = "country_norm",
+) -> pd.DataFrame:
+    """Block 5: Country as soft blocking signal (same country)."""
+    # Build country -> entity_ids mapping for S2/S3
+    country_to_s2 = defaultdict(list)
+    for _, row in s2.iterrows():
+        country = row[country_col] if country_col in row else row.get("country", "")
+        if country:
+            country_to_s2[country].append(row["entity_id"])
+
+    country_to_s3 = defaultdict(list)
+    for _, row in s3.iterrows():
+        country = row[country_col] if country_col in row else row.get("country", "")
+        if country:
+            country_to_s3[country].append(row["entity_id"])
+
+    rows = []
+    for _, s1_row in s1.iterrows():
+        s1_id = s1_row["entity_id"]
+        country = s1_row[country_col] if country_col in s1_row else s1_row.get("country", "")
+        if not country:
+            continue
+
+        for cand_id in country_to_s2.get(country, []):
+            rows.append({
+                "s1_id": s1_id,
+                "candidate_id": cand_id,
+                "candidate_source": "S2",
+                "blocking_method": "country",
+            })
+        for cand_id in country_to_s3.get(country, []):
+            rows.append({
+                "s1_id": s1_id,
+                "candidate_id": cand_id,
+                "candidate_source": "S3",
+                "blocking_method": "country",
+            })
+
+    df = pd.DataFrame(rows)
+    logger.info(f"Block 5 (country): {len(df)} candidate pairs")
+    return df
+
+
+# ── Block 6: Embedding Nearest Neighbors (placeholder) ──────────────
+
+def block_embedding_knn(
+    s1: pd.DataFrame,
+    s2: pd.DataFrame,
+    s3: pd.DataFrame,
+    top_k: int = DEFAULT_EMBEDDING_TOP_K,
+    embedding_col: str = "embedding",  # Will be added later
+) -> pd.DataFrame:
+    """Block 6: Embedding-based nearest neighbor retrieval."""
+    # Placeholder - will be implemented after embeddings.py
+    logger.warning("Block 6 (embedding KNN) not yet implemented - returning empty")
+    return pd.DataFrame(columns=["s1_id", "candidate_id", "candidate_source", "blocking_method"])
+
+
+# ── Candidate Union & Deduplication ─────────────────────────────────
+
+def union_candidates(block_dfs: List[pd.DataFrame]) -> pd.DataFrame:
     """
-    Token blocking: if S1 and S2/S3 share at least min_shared_tokens
-    name tokens, they are candidates.
+    Union all blocking results, deduplicate, and aggregate blocking methods.
+
+    Returns:
+        DataFrame with columns: s1_id, candidate_id, candidate_source, blocking_methods
     """
-    logger.info("Building token blocking candidates...")
+    if not block_dfs:
+        return pd.DataFrame(columns=["s1_id", "candidate_id", "candidate_source", "blocking_methods"])
 
-    # Build inverted index for S2/S3
-    inverted_index = defaultdict(set)
-    for _, row in s2s3_df.iterrows():
-        tokens = set(row["name_norm"].split())
-        for tok in tokens:
-            if len(tok) >= 3:  # Skip very short tokens
-                inverted_index[tok].add(row["entity_id"])
+    # Concatenate all
+    all_candidates = pd.concat(block_dfs, ignore_index=True)
 
-    # Prune blocks that are too large (common words)
-    inverted_index = {
-        tok: ids for tok, ids in inverted_index.items()
-        if len(ids) <= max_block_size
-    }
+    # Group by (s1_id, candidate_id, candidate_source) and aggregate methods
+    agg = all_candidates.groupby(["s1_id", "candidate_id", "candidate_source"]).agg(
+        blocking_methods=("blocking_method", lambda x: "|".join(sorted(set(x)))),
+    ).reset_index()
 
-    candidates = {}
-    for _, row in s1_df.iterrows():
-        s1_id = row["entity_id"]
-        tokens = set(row["name_norm"].split())
-        candidate_counts = defaultdict(int)
-        for tok in tokens:
-            if tok in inverted_index:
-                for s2s3_id in inverted_index[tok]:
-                    candidate_counts[s2s3_id] += 1
+    # Add score columns if present
+    score_cols = [c for c in all_candidates.columns if c not in ["s1_id", "candidate_id", "candidate_source", "blocking_method"]]
+    if score_cols:
+        # Take max score per method
+        for col in score_cols:
+            score_agg = all_candidates.groupby(["s1_id", "candidate_id", "candidate_source"])[col].max().reset_index()
+            score_agg.columns = ["s1_id", "candidate_id", "candidate_source", col]
+            agg = agg.merge(score_agg, on=["s1_id", "candidate_id", "candidate_source"], how="left")
 
-        cands = [
-            (cid, count)
-            for cid, count in candidate_counts.items()
-            if count >= min_shared_tokens
-        ]
-        candidates[s1_id] = cands
-
-    logger.info(f"  Token blocking generated candidates for {len(candidates)} S1 entities")
-    return candidates
+    logger.info(f"Union of {len(block_dfs)} blocks: {len(agg)} unique candidate pairs")
+    return agg
 
 
 def generate_candidates(
-    s1_df: pd.DataFrame,
-    s2_df: pd.DataFrame,
-    s3_df: pd.DataFrame,
-    top_k_word: int = 50,
-    top_k_char: int = 30,
-    min_shared_tokens: int = 2,
-) -> dict:
+    s1: pd.DataFrame,
+    s2: pd.DataFrame,
+    s3: pd.DataFrame,
+    config: Dict = None,
+) -> pd.DataFrame:
     """
-    Main blocking function. Combines multiple blocking strategies
-    and filters by country.
+    Generate candidates using all blocking methods.
 
-    Returns dict: s1_entity_id -> set of candidate s2/s3 entity_ids
+    Args:
+        s1, s2, s3: Normalized source DataFrames
+        config: Dict with blocking parameters
+
+    Returns:
+        Candidate pairs DataFrame
     """
-    logger.info("Starting candidate generation...")
+    config = config or {}
 
-    # Combine S2 and S3
-    s2s3_df = pd.concat([s2_df, s3_df], ignore_index=True)
+    # Block 1: Exact name
+    b1 = block_exact_name(s1, s2, s3)
 
-    # Group by country for country-aware blocking
-    s1_countries = s1_df["country_norm"].unique()
-    s2s3_countries = s2s3_df["country_norm"].unique()
-    all_countries = set(list(s1_countries) + list(s2s3_countries))
+    # Block 2: TF-IDF name
+    b2 = block_tfidf_name(
+        s1, s2, s3,
+        top_k=config.get("tfidf_name_top_k", DEFAULT_TFIDF_NAME_TOP_K),
+        ngram_range=config.get("tfidf_name_ngram_range", (2, 5)),
+    )
 
-    all_candidates = defaultdict(set)
+    # Block 3: TF-IDF address
+    b3 = block_tfidf_address(
+        s1, s2, s3,
+        top_k=config.get("tfidf_addr_top_k", DEFAULT_TFIDF_ADDRESS_TOP_K),
+        ngram_range=config.get("tfidf_addr_ngram_range", (2, 6)),
+    )
 
-    for country in all_countries:
-        s1_country = s1_df[s1_df["country_norm"] == country]
-        s2s3_country = s2s3_df[s2s3_df["country_norm"] == country]
+    # Block 4: Token Jaccard
+    b4 = block_token_jaccard(
+        s1, s2, s3,
+        min_shared=config.get("token_min_shared", DEFAULT_TOKEN_MIN_SHARED),
+    )
 
-        if len(s1_country) == 0 or len(s2s3_country) == 0:
-            logger.info(f"  Skipping country '{country}': S1={len(s1_country)}, S2S3={len(s2s3_country)}")
-            continue
+    # Block 5: Country
+    b5 = block_by_country(s1, s2, s3)
 
-        logger.info(f"  Processing country '{country}': S1={len(s1_country)}, S2S3={len(s2s3_country)}")
+    # Block 6: Embeddings (optional)
+    b6 = pd.DataFrame()
+    if config.get("use_embeddings", False):
+        b6 = block_embedding_knn(s1, s2, s3, top_k=config.get("embedding_top_k", DEFAULT_EMBEDDING_TOP_K))
 
-        # Strategy 1: Word-level TF-IDF on combined text
-        word_cands = _build_tfidf_candidates(
-            s1_country, s2s3_country,
-            text_col="combined_text",
-            top_k=top_k_word,
-            ngram_range=(1, 2),
-            analyzer="word",
-            min_score=0.05,
-        )
-        for s1_id, cands in word_cands.items():
-            for cid, _ in cands:
-                all_candidates[s1_id].add(cid)
+    # Union all
+    candidates = union_candidates([b1, b2, b3, b4, b5, b6])
 
-        # Strategy 2: Char n-gram TF-IDF on name
-        char_cands = _build_char_ngram_candidates(
-            s1_country, s2s3_country,
-            top_k=top_k_char,
-            min_score=0.1,
-        )
-        for s1_id, cands in char_cands.items():
-            for cid, _ in cands:
-                all_candidates[s1_id].add(cid)
+    # Ensure all S1 entities appear (even with 0 candidates)
+    all_s1 = set(s1["entity_id"].astype(str))
+    candidates_s1 = set(candidates["s1_id"].astype(str))
+    missing_s1 = all_s1 - candidates_s1
 
-        # Strategy 3: Token blocking on name
-        tok_cands = _build_token_blocking_candidates(
-            s1_country, s2s3_country,
-            min_shared_tokens=min_shared_tokens,
-        )
-        for s1_id, cands in tok_cands.items():
-            for cid, _ in cands:
-                all_candidates[s1_id].add(cid)
+    if missing_s1:
+        missing_rows = pd.DataFrame([{
+            "s1_id": s1_id,
+            "candidate_id": "",
+            "candidate_source": "",
+            "blocking_methods": "",
+        } for s1_id in missing_s1])
+        candidates = pd.concat([candidates, missing_rows], ignore_index=True)
+        logger.info(f"Added {len(missing_s1)} S1 entities with 0 candidates")
 
-    # Ensure every S1 entity has an entry (even if empty)
-    for s1_id in s1_df["entity_id"].values:
-        if s1_id not in all_candidates:
-            all_candidates[s1_id] = set()
-
-    total_pairs = sum(len(v) for v in all_candidates.values())
-    avg_cands = total_pairs / max(len(all_candidates), 1)
-    logger.info(f"Candidate generation complete: {total_pairs} total pairs, avg {avg_cands:.1f} per S1 entity")
-
-    return dict(all_candidates)
+    return candidates
 
 
-def evaluate_blocking_recall(candidates: dict, ground_truth: dict) -> float:
-    """
-    Compute blocking recall: fraction of true matches that appear
-    in the candidate set.
-    """
-    total_true = 0
-    found = 0
-    for s1_id, true_matches in ground_truth.items():
-        if not true_matches:
-            continue
-        cands = candidates.get(s1_id, set())
-        for m in true_matches:
-            total_true += 1
-            if m in cands:
-                found += 1
-    recall = found / max(total_true, 1)
-    logger.info(f"Blocking recall: {recall:.4f} ({found}/{total_true})")
-    return recall
+def save_candidate_pairs(candidates: pd.DataFrame, output_path: Path, is_test: bool = False):
+    """Save candidate pairs in required TSV format."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Group by s1_id and join candidate_ids
+    grouped = candidates[candidates["candidate_id"] != ""].groupby("s1_id")["candidate_id"].apply(
+        lambda x: ",".join(sorted(set(x)))
+    ).reset_index()
+
+    # Ensure all S1 entities present
+    all_s1 = set(candidates["s1_id"].unique())
+    grouped_s1 = set(grouped["s1_id"])
+    missing = all_s1 - grouped_s1
+
+    if missing:
+        missing_df = pd.DataFrame({"s1_id": list(missing), "candidate_id": ""})
+        grouped = pd.concat([grouped, missing_df], ignore_index=True)
+
+    # Sort and write
+    grouped = grouped.sort_values("s1_id")
+    grouped.to_csv(output_path, sep="\t", index=False)
+    logger.info(f"Saved candidate pairs to {output_path} ({len(grouped)} S1 entities)")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    # Quick test with small sample
+    s1, s2, s3 = load_all_sources(train=True)
+    s1_sample = s1.head(1000)
+    s2_sample = s2.head(5000)
+    s3_sample = s3.head(5000)
+
+    candidates = generate_candidates(s1_sample, s2_sample, s3_sample)
+    print(f"Generated {len(candidates)} candidate pairs")
+    print(candidates.head())

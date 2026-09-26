@@ -1,337 +1,232 @@
 """
-Feature engineering for entity resolution.
+High-level feature engineering pipeline.
 
-For each candidate pair (S1 entity, S2/S3 entity), compute a rich set
-of string similarity and structural features.
+Combines similarity features with metadata for model training/inference.
 """
+
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from collections import Counter
-import logging
+
+from config import CACHE_DIR
+from io_utils import load_tsv
+from normalization import add_normalized_columns
+from similarity import (
+    compute_all_features,
+    compute_name_features,
+    compute_address_features,
+    compute_general_features,
+)
 
 logger = logging.getLogger(__name__)
 
+# Feature column groups for reference
+NAME_FEATURES = [
+    "name_exact", "name_ratio", "name_wratio", "name_qratio",
+    "name_token_sort", "name_token_set", "name_partial",
+    "name_levenshtein", "name_jaccard_char", "name_dice",
+    "name_len_diff", "name_len_ratio", "name_tok_diff",
+    "name_shared_toks", "name_jaccard_tok",
+    "name_tfidf_char", "name_tfidf_tok",
+]
 
-# ── String similarity functions ──────────────────────────────────────
+ADDR_FEATURES = [
+    "addr_exact", "addr_ratio", "addr_wratio", "addr_qratio",
+    "addr_token_sort", "addr_token_set", "addr_partial",
+    "addr_levenshtein", "addr_jaccard_char", "addr_dice",
+    "addr_len_diff", "addr_len_ratio", "addr_tok_diff",
+    "addr_shared_toks", "addr_jaccard_tok",
+    "addr_tfidf_char", "addr_tfidf_tok",
+    "postal_match", "house_num_match", "digit_overlap",
+    "digit_jaccard", "shared_numeric_toks", "addr_tok_overlap",
+]
 
-def levenshtein_distance(s1: str, s2: str) -> int:
-    """Compute Levenshtein edit distance between two strings."""
-    if len(s1) < len(s2):
-        return levenshtein_distance(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
+GENERAL_FEATURES = [
+    "country_exact", "country_norm_match",
+    "name_missing", "cand_name_missing",
+    "addr_missing", "cand_addr_missing",
+    "source_s2_s3",
+]
 
-    prev_row = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        curr_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = prev_row[j + 1] + 1
-            deletions = curr_row[j] + 1
-            substitutions = prev_row[j] + (c1 != c2)
-            curr_row.append(min(insertions, deletions, substitutions))
-        prev_row = curr_row
-
-    return prev_row[-1]
-
-
-def levenshtein_similarity(s1: str, s2: str) -> float:
-    """Normalized Levenshtein similarity (0-1)."""
-    if not s1 and not s2:
-        return 1.0
-    if not s1 or not s2:
-        return 0.0
-    dist = levenshtein_distance(s1, s2)
-    max_len = max(len(s1), len(s2))
-    return 1.0 - dist / max_len
+ALL_FEATURES = NAME_FEATURES + ADDR_FEATURES + GENERAL_FEATURES
 
 
-def jaro_similarity(s1: str, s2: str) -> float:
-    """Compute Jaro similarity between two strings."""
-    if s1 == s2:
-        return 1.0
-    if not s1 or not s2:
-        return 0.0
+def prepare_sources_for_features(train: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load and normalize all sources for feature computation."""
+    from config import TRAIN_SOURCE1, TRAIN_SOURCE2, TRAIN_SOURCE3, TEST_SOURCE1, TEST_SOURCE2, TEST_SOURCE3
 
-    len1, len2 = len(s1), len(s2)
-    match_distance = max(len1, len2) // 2 - 1
-    if match_distance < 0:
-        match_distance = 0
+    if train:
+        s1 = load_tsv(TRAIN_SOURCE1)
+        s2 = load_tsv(TRAIN_SOURCE2)
+        s3 = load_tsv(TRAIN_SOURCE3)
+    else:
+        s1 = load_tsv(TEST_SOURCE1)
+        s2 = load_tsv(TEST_SOURCE2)
+        s3 = load_tsv(TEST_SOURCE3)
 
-    s1_matches = [False] * len1
-    s2_matches = [False] * len2
+    for df in [s1, s2, s3]:
+        add_normalized_columns(df)
 
-    matches = 0
-    transpositions = 0
-
-    for i in range(len1):
-        start = max(0, i - match_distance)
-        end = min(i + match_distance + 1, len2)
-        for j in range(start, end):
-            if s2_matches[j] or s1[i] != s2[j]:
-                continue
-            s1_matches[i] = True
-            s2_matches[j] = True
-            matches += 1
-            break
-
-    if matches == 0:
-        return 0.0
-
-    k = 0
-    for i in range(len1):
-        if not s1_matches[i]:
-            continue
-        while not s2_matches[k]:
-            k += 1
-        if s1[i] != s2[k]:
-            transpositions += 1
-        k += 1
-
-    jaro = (matches / len1 + matches / len2 +
-            (matches - transpositions / 2) / matches) / 3
-    return jaro
-
-
-def jaro_winkler_similarity(s1: str, s2: str, p: float = 0.1) -> float:
-    """Compute Jaro-Winkler similarity."""
-    jaro = jaro_similarity(s1, s2)
-    prefix_len = 0
-    for i in range(min(4, min(len(s1), len(s2)))):
-        if s1[i] == s2[i]:
-            prefix_len += 1
-        else:
-            break
-    return jaro + prefix_len * p * (1 - jaro)
-
-
-def jaccard_similarity(s1: str, s2: str) -> float:
-    """Token-level Jaccard similarity."""
-    if not s1 and not s2:
-        return 1.0
-    if not s1 or not s2:
-        return 0.0
-    set1 = set(s1.split())
-    set2 = set(s2.split())
-    if not set1 and not set2:
-        return 1.0
-    intersection = set1 & set2
-    union = set1 | set2
-    return len(intersection) / len(union) if union else 0.0
-
-
-def token_overlap_ratio(s1: str, s2: str) -> float:
-    """Fraction of tokens in s1 that appear in s2."""
-    if not s1:
-        return 0.0
-    tokens1 = set(s1.split())
-    tokens2 = set(s2.split())
-    if not tokens1:
-        return 0.0
-    return len(tokens1 & tokens2) / len(tokens1)
-
-
-def containment_similarity(s1: str, s2: str) -> float:
-    """Max of both directional containment ratios."""
-    if not s1 and not s2:
-        return 1.0
-    if not s1 or not s2:
-        return 0.0
-    tokens1 = set(s1.split())
-    tokens2 = set(s2.split())
-    if not tokens1 or not tokens2:
-        return 0.0
-    inter = len(tokens1 & tokens2)
-    return max(inter / len(tokens1), inter / len(tokens2))
-
-
-def cosine_similarity_tokens(s1: str, s2: str) -> float:
-    """Token-level cosine similarity using term frequency vectors."""
-    if not s1 and not s2:
-        return 1.0
-    if not s1 or not s2:
-        return 0.0
-    counter1 = Counter(s1.split())
-    counter2 = Counter(s2.split())
-    all_tokens = set(counter1.keys()) | set(counter2.keys())
-    dot = sum(counter1.get(t, 0) * counter2.get(t, 0) for t in all_tokens)
-    mag1 = sum(v ** 2 for v in counter1.values()) ** 0.5
-    mag2 = sum(v ** 2 for v in counter2.values()) ** 0.5
-    if mag1 == 0 or mag2 == 0:
-        return 0.0
-    return dot / (mag1 * mag2)
-
-
-def char_ngram_jaccard(s1: str, s2: str, n: int = 3) -> float:
-    """Character n-gram Jaccard similarity."""
-    if not s1 and not s2:
-        return 1.0
-    if not s1 or not s2:
-        return 0.0
-    ngrams1 = set(s1[i:i+n] for i in range(len(s1) - n + 1))
-    ngrams2 = set(s2[i:i+n] for i in range(len(s2) - n + 1))
-    if not ngrams1 and not ngrams2:
-        return 1.0
-    if not ngrams1 or not ngrams2:
-        return 0.0
-    inter = ngrams1 & ngrams2
-    union = ngrams1 | ngrams2
-    return len(inter) / len(union)
-
-
-def _extract_numbers(text: str) -> set:
-    """Extract all numeric tokens from text."""
-    import re
-    return set(re.findall(r'\d+', text))
-
-
-def number_overlap(s1: str, s2: str) -> float:
-    """Fraction of numbers in common between two address strings."""
-    nums1 = _extract_numbers(s1)
-    nums2 = _extract_numbers(s2)
-    if not nums1 and not nums2:
-        return 1.0
-    if not nums1 or not nums2:
-        return 0.0
-    inter = nums1 & nums2
-    union = nums1 | nums2
-    return len(inter) / len(union)
-
-
-def sorted_token_similarity(s1: str, s2: str) -> float:
-    """Sort tokens alphabetically and compare — handles word reordering."""
-    if not s1 and not s2:
-        return 1.0
-    if not s1 or not s2:
-        return 0.0
-    sorted1 = " ".join(sorted(s1.split()))
-    sorted2 = " ".join(sorted(s2.split()))
-    return jaro_winkler_similarity(sorted1, sorted2)
-
-
-# ── Feature extraction ───────────────────────────────────────────────
-
-def compute_pair_features(row_s1: pd.Series, row_s2s3: pd.Series) -> dict:
-    """
-    Compute all features for a single (S1, S2/S3) candidate pair.
-    """
-    name1 = row_s1.get("name_norm", "")
-    name2 = row_s2s3.get("name_norm", "")
-    addr1 = row_s1.get("addr_norm", "")
-    addr2 = row_s2s3.get("addr_norm", "")
-    comb1 = row_s1.get("combined_text", "")
-    comb2 = row_s2s3.get("combined_text", "")
-
-    features = {}
-
-    # ── Name features ──
-    features["name_levenshtein"] = levenshtein_similarity(name1, name2)
-    features["name_jaro_winkler"] = jaro_winkler_similarity(name1, name2)
-    features["name_jaccard"] = jaccard_similarity(name1, name2)
-    features["name_token_overlap"] = token_overlap_ratio(name1, name2)
-    features["name_containment"] = containment_similarity(name1, name2)
-    features["name_cosine"] = cosine_similarity_tokens(name1, name2)
-    features["name_char3gram"] = char_ngram_jaccard(name1, name2, 3)
-    features["name_char4gram"] = char_ngram_jaccard(name1, name2, 4)
-    features["name_sorted_jw"] = sorted_token_similarity(name1, name2)
-    features["name_len_ratio"] = (
-        min(len(name1), len(name2)) / max(len(name1), len(name2))
-        if max(len(name1), len(name2)) > 0 else 1.0
-    )
-    features["name_token_count_diff"] = abs(len(name1.split()) - len(name2.split()))
-
-    # ── Address features ──
-    features["addr_levenshtein"] = levenshtein_similarity(addr1, addr2)
-    features["addr_jaro_winkler"] = jaro_winkler_similarity(addr1, addr2)
-    features["addr_jaccard"] = jaccard_similarity(addr1, addr2)
-    features["addr_token_overlap"] = token_overlap_ratio(addr1, addr2)
-    features["addr_containment"] = containment_similarity(addr1, addr2)
-    features["addr_cosine"] = cosine_similarity_tokens(addr1, addr2)
-    features["addr_char3gram"] = char_ngram_jaccard(addr1, addr2, 3)
-    features["addr_number_overlap"] = number_overlap(addr1, addr2)
-    features["addr_sorted_jw"] = sorted_token_similarity(addr1, addr2)
-    features["addr_len_ratio"] = (
-        min(len(addr1), len(addr2)) / max(len(addr1), len(addr2))
-        if max(len(addr1), len(addr2)) > 0 else 1.0
-    )
-
-    # ── Combined features ──
-    features["comb_jaccard"] = jaccard_similarity(comb1, comb2)
-    features["comb_cosine"] = cosine_similarity_tokens(comb1, comb2)
-    features["comb_char3gram"] = char_ngram_jaccard(comb1, comb2, 3)
-
-    # ── Structural features ──
-    features["both_empty_addr"] = 1.0 if (not addr1.strip() and not addr2.strip()) else 0.0
-    features["one_empty_addr"] = 1.0 if (bool(addr1.strip()) != bool(addr2.strip())) else 0.0
-    features["name_exact_match"] = 1.0 if name1 == name2 and name1 else 0.0
-
-    return features
+    return s1, s2, s3
 
 
 def build_feature_matrix(
+    candidates_df: pd.DataFrame,
     s1_df: pd.DataFrame,
-    s2s3_df: pd.DataFrame,
-    candidates: dict,
-    ground_truth: dict = None,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    cache_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """
-    Build a feature matrix for all candidate pairs.
+    Build complete feature matrix for candidate pairs.
 
     Args:
-        s1_df: Preprocessed Source 1 dataframe
-        s2s3_df: Preprocessed Source 2+3 dataframe (concatenated)
-        candidates: dict s1_id -> set of candidate s2s3 ids
-        ground_truth: optional dict s1_id -> set of true match ids (for labels)
+        candidates_df: DataFrame with s1_id, candidate_id, candidate_source, [label], [blocking_methods]
+        s1_df, s2_df, s3_df: Normalized source DataFrames
+        cache_path: Optional path to cache computed features
 
     Returns:
-        DataFrame with features, s1_id, s2s3_id, and optionally 'label'
+        Feature DataFrame with all features + identifiers
     """
-    logger.info("Building feature matrix...")
+    if cache_path and cache_path.exists():
+        logger.info(f"Loading cached features from {cache_path}")
+        return pd.read_parquet(cache_path)
 
-    # Index S2/S3 by entity_id for fast lookup
-    s2s3_idx = s2s3_df.set_index("entity_id")
-    s1_idx = s1_df.set_index("entity_id")
+    logger.info(f"Building features for {len(candidates_df)} candidate pairs...")
 
-    rows = []
-    total_pairs = sum(len(v) for v in candidates.values())
-    processed = 0
+    features = compute_all_features(candidates_df, s1_df, s2_df, s3_df)
 
-    for s1_id, cand_ids in candidates.items():
-        if s1_id not in s1_idx.index:
-            continue
-        row_s1 = s1_idx.loc[s1_id]
+    # Ensure feature columns are float
+    for col in ALL_FEATURES:
+        if col in features.columns:
+            features[col] = features[col].astype(float)
 
-        for cand_id in cand_ids:
-            if cand_id not in s2s3_idx.index:
-                continue
-            row_s2s3 = s2s3_idx.loc[cand_id]
+    # Fill any NaN
+    features = features.fillna(0.0)
 
-            feats = compute_pair_features(row_s1, row_s2s3)
-            feats["s1_id"] = s1_id
-            feats["s2s3_id"] = cand_id
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        features.to_parquet(cache_path)
+        logger.info(f"Cached features to {cache_path}")
 
-            if ground_truth is not None:
-                true_matches = ground_truth.get(s1_id, set())
-                feats["label"] = 1 if cand_id in true_matches else 0
-
-            rows.append(feats)
-
-            processed += 1
-            if processed % 50000 == 0:
-                logger.info(f"  Processed {processed}/{total_pairs} pairs...")
-
-    df = pd.DataFrame(rows)
-    logger.info(f"Feature matrix: {len(df)} pairs, {len(df.columns)} columns")
-
-    if ground_truth is not None and "label" in df.columns:
-        n_pos = (df["label"] == 1).sum()
-        n_neg = (df["label"] == 0).sum()
-        logger.info(f"  Positives: {n_pos}, Negatives: {n_neg}, Ratio: 1:{n_neg/max(n_pos,1):.1f}")
-
-    return df
+    logger.info(f"Feature matrix shape: {features.shape}")
+    return features
 
 
-def get_feature_columns(df: pd.DataFrame) -> list:
-    """Get the list of feature columns (exclude IDs and label)."""
-    exclude = {"s1_id", "s2s3_id", "label"}
-    return [c for c in df.columns if c not in exclude]
+def get_feature_columns(features_df: pd.DataFrame) -> List[str]:
+    """Get list of feature column names (excludes identifier/label columns)."""
+    exclude = {"s1_id", "candidate_id", "candidate_source", "label", "blocking_methods"}
+    return [c for c in features_df.columns if c not in exclude]
+
+
+def select_features(
+    features_df: pd.DataFrame,
+    feature_list: Optional[List[str]] = None,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """
+    Select features for modeling.
+
+    Returns:
+        X: Feature matrix
+        y: Labels (or zeros if not present)
+        feature_names: List of feature names used
+    """
+    if feature_list is None:
+        feature_list = get_feature_columns(features_df)
+
+    X = features_df[feature_list].values
+    y = features_df["label"].values if "label" in features_df.columns else np.zeros(len(features_df))
+
+    return X, y, feature_list
+
+
+def add_embedding_features(
+    features_df: pd.DataFrame,
+    s1_embeddings: Dict[str, np.ndarray],
+    cand_embeddings: Dict[str, np.ndarray],
+    prefix: str = "emb",
+) -> pd.DataFrame:
+    """
+    Add embedding cosine similarity features.
+
+    Args:
+        features_df: Feature DataFrame with s1_id, candidate_id columns
+        s1_embeddings: Dict mapping s1_id -> embedding vector
+        cand_embeddings: Dict mapping candidate_id -> embedding vector
+        prefix: Prefix for new feature columns
+
+    Returns:
+        DataFrame with added embedding features
+    """
+    out = features_df.copy()
+
+    def cosine_sim(a, b):
+        if a is None or b is None:
+            return 0.0
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
+
+    out[f"{prefix}_cosine"] = out.apply(
+        lambda r: cosine_sim(s1_embeddings.get(r["s1_id"]), cand_embeddings.get(r["candidate_id"])),
+        axis=1,
+    )
+
+    return out
+
+
+def add_entity_level_features(features_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add entity-level features (computed per S1 entity).
+
+    Features:
+    - top_score, second_score, third_score (requires model scores)
+    - score_margin (top - second)
+    - n_above_threshold
+    - n_high_confidence
+    """
+    # This is a placeholder - requires model scores to be computed first
+    # Actual implementation in decision.py after scoring
+    return features_df
+
+
+def save_feature_importance(
+    feature_names: List[str],
+    importances: np.ndarray,
+    output_path: Path,
+):
+    """Save feature importance for analysis."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    imp_df = pd.DataFrame({
+        "feature": feature_names,
+        "importance": importances,
+    }).sort_values("importance", ascending=False)
+    imp_df.to_csv(output_path, index=False)
+    logger.info(f"Saved feature importance to {output_path}")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    # Test feature computation on small sample
+    s1, s2, s3 = prepare_sources_for_features(train=True)
+    s1_s = s1.head(100)
+    s2_s = s2.head(500)
+    s3_s = s3.head(500)
+
+    from blocking import generate_candidates
+    candidates = generate_candidates(s1_s, s2_s, s3_s)
+
+    features = build_feature_matrix(candidates, s1_s, s2_s, s3_s)
+    print(f"Features shape: {features.shape}")
+    print(f"Feature columns: {get_feature_columns(features)}")
+    print(features.head())
